@@ -14,6 +14,7 @@ const emit = defineEmits<{
 }>()
 
 const isEditing = ref(false)
+
 const customUrl = ref(DEFAULT_MODEL_URL)
 
 function startEdit() {
