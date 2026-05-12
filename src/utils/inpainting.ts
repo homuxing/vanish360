@@ -1,4 +1,4 @@
-import * as ort from 'onnxruntime-web'
+import * as ort from 'onnxruntime-web/wasm'
 import { generateBinaryMask } from './mask'
 import { getSession, loadModel } from './model'
 import type { Stroke } from '../composables/useEditorState'
