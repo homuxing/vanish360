@@ -156,8 +156,6 @@ export async function loadModel(modelUrl: string = DEFAULT_MODEL_URL): Promise<v
     ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4
     ort.env.wasm.simd = true
     ort.env.wasm.proxy = true
-    // 指定绝对路径，解决 proxy Worker 内 import.meta.url 解析问题
-    ort.env.wasm.wasmPaths = '/wasm/'
 
     let modelBuffer = await getCachedModel()
 
