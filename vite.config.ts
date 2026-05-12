@@ -7,6 +7,9 @@ export default defineConfig({
   build: {
     chunkSizeWarningLimit: 2000,
   },
+  optimizeDeps: {
+    exclude: ['onnxruntime-web'],
+  },
   server: {
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
