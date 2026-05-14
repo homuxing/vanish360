@@ -3,7 +3,7 @@ import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import { useEditorState } from '../composables/useEditorState'
-import { drawMaskOnCanvas } from '../utils/mask'
+import { drawMaskOnCanvas, drawEllipseStamp, drawSegmentWithStamps } from '../utils/mask'
 
 const {
   imageUrl,
@@ -223,8 +223,8 @@ function redrawFullMask() {
   const mw = maskCanvas.width
   const mh = maskCanvas.height
   maskCtx.clearRect(0, 0, mw, mh)
-  // 在低分辨率蒙版上重绘所有笔迹
-  drawMaskOnCanvas(maskCtx, strokes.value, mw, mh, currentStroke.value, 'white', false)
+  // 在低分辨率蒙版上重绘所有笔迹，传入 MASK_SCALE 保持与 appendToMask 一致
+  drawMaskOnCanvas(maskCtx, strokes.value, mw, mh, currentStroke.value, 'white', false, MASK_SCALE)
   maskDirty = true
 }
 
@@ -234,41 +234,32 @@ function appendToMask() {
   const points = stroke.points
   const mw = maskCanvas.width
   const mh = maskCanvas.height
-  // 笔迹 size 也要按比例缩放
-  const scaledSize = stroke.size * MASK_SCALE
+  const baseRadius = (stroke.size * MASK_SCALE) / 2
 
-  if (points.length < 2) {
-    if (points.length === 1) {
-      const x = points[0][0] * mw
-      const y = (1 - points[0][1]) * mh
-      maskCtx.fillStyle = 'white'
-      maskCtx.beginPath()
-      maskCtx.arc(x, y, scaledSize / 2, 0, Math.PI * 2)
-      maskCtx.fill()
-    }
-    lastPointCount = points.length
-    maskDirty = true
+  if (points.length === 0) {
+    lastPointCount = 0
     return
   }
 
-  // 增量绘制新线段
+  maskCtx.fillStyle = 'white'
+
+  // 增量绘制：从 lastPointCount 位置开始
   const startIdx = Math.max(0, lastPointCount - 1)
-  maskCtx.strokeStyle = 'white'
-  maskCtx.lineWidth = scaledSize
-  maskCtx.lineCap = 'round'
-  maskCtx.lineJoin = 'round'
 
-  maskCtx.beginPath()
-  const x0 = points[startIdx][0] * mw
-  const y0 = (1 - points[startIdx][1]) * mh
-  maskCtx.moveTo(x0, y0)
-
-  for (let i = startIdx + 1; i < points.length; i++) {
-    const x = points[i][0] * mw
-    const y = (1 - points[i][1]) * mh
-    maskCtx.lineTo(x, y)
+  if (points.length === 1 && lastPointCount === 0) {
+    // 单点绘制椭圆
+    drawEllipseStamp(maskCtx, points[0][0], points[0][1], baseRadius, mw, mh)
+  } else {
+    // 绘制新增的线段
+    for (let i = startIdx; i < points.length - 1; i++) {
+      drawSegmentWithStamps(maskCtx, points[i], points[i + 1], baseRadius, mw, mh)
+    }
+    // 确保最后一点被绘制
+    if (lastPointCount < points.length) {
+      const last = points[points.length - 1]
+      drawEllipseStamp(maskCtx, last[0], last[1], baseRadius, mw, mh)
+    }
   }
-  maskCtx.stroke()
 
   lastPointCount = points.length
   maskDirty = true

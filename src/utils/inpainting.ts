@@ -73,6 +73,31 @@ function tensorToImageData(tensor: Float32Array, width: number, height: number):
 }
 
 /**
+ * 根据 tile 行的纬度位置计算自适应水平步进
+ * 极点附近像素在球面上高度重叠，可以使用更大步进减少冗余 tile
+ */
+function getAdaptiveStepX(
+  tileY: number,
+  tileSize: number,
+  imageHeight: number,
+  baseStepSize: number
+): number {
+  // tile 中心的归一化纵坐标（0=顶部/北极，1=底部/南极）
+  const tileCenterY = tileY + tileSize / 2
+  const v = tileCenterY / imageHeight
+  // 纬度：赤道=0，极点=±π/2
+  const latitude = Math.PI * (v - 0.5)
+  const cosLat = Math.max(Math.cos(latitude), 0.125)
+
+  // 极点处步进更大（像素冗余高），但不超过 tileSize - 16（保证最少 16px overlap）
+  const adaptiveStep = Math.min(
+    Math.round(baseStepSize / cosLat),
+    tileSize - 16
+  )
+  return Math.max(baseStepSize, adaptiveStep)
+}
+
+/**
  * 对蒙版区域执行 LaMa inpainting
  */
 export async function processInpainting(
@@ -143,26 +168,39 @@ export async function processInpainting(
   const bw = Math.min(width - bx, bounds.w + padding * 2)
   const bh = Math.min(height - by, bounds.h + padding * 2)
 
-  // 计算 tile
+  // 计算 tile（纬度自适应水平步进）
   const tileSize = LAMA_SIZE
   const overlap = 64
-  const stepSize = tileSize - overlap * 2
+  const baseStepSize = tileSize - overlap * 2
 
-  const tilesX = Math.max(1, Math.ceil(bw / stepSize))
-  const tilesY = Math.max(1, Math.ceil(bh / stepSize))
-  const totalTiles = tilesX * tilesY
-  console.log(`[processInpainting] 分块: ${tilesX}x${tilesY} = ${totalTiles} tiles`)
+  const tilesY = Math.max(1, Math.ceil(bh / baseStepSize))
+
+  // 预计算总 tile 数（考虑纬度自适应）
+  let totalTiles = 0
+  const rowTileCounts: number[] = []
+  for (let ty = 0; ty < tilesY; ty++) {
+    let tileY = by + ty * baseStepSize
+    if (tileY + tileSize > height) tileY = Math.max(0, height - tileSize)
+    const adaptiveStepX = getAdaptiveStepX(tileY, tileSize, height, baseStepSize)
+    const tilesXForRow = Math.max(1, Math.ceil(bw / adaptiveStepX))
+    rowTileCounts.push(tilesXForRow)
+    totalTiles += tilesXForRow
+  }
+  console.log(`[processInpainting] 分块: ${tilesY} 行, 总计 ${totalTiles} tiles (纬度自适应)`)
 
   let processed = 0
   let inferenceTime = 0
 
   for (let ty = 0; ty < tilesY; ty++) {
-    for (let tx = 0; tx < tilesX; tx++) {
-      let tileX = bx + tx * stepSize
-      let tileY = by + ty * stepSize
+    let tileY = by + ty * baseStepSize
+    if (tileY + tileSize > height) tileY = Math.max(0, height - tileSize)
 
+    const adaptiveStepX = getAdaptiveStepX(tileY, tileSize, height, baseStepSize)
+    const tilesXForRow = rowTileCounts[ty]
+
+    for (let tx = 0; tx < tilesXForRow; tx++) {
+      let tileX = bx + tx * adaptiveStepX
       if (tileX + tileSize > width) tileX = Math.max(0, width - tileSize)
-      if (tileY + tileSize > height) tileY = Math.max(0, height - tileSize)
 
       const tileW = Math.min(tileSize, width - tileX)
       const tileH = Math.min(tileSize, height - tileY)
