@@ -18,7 +18,6 @@ const originalImage = shallowRef<HTMLImageElement | ImageBitmap | null>(null)
 
 const mode = ref<EditMode>('view')
 const brushSize = ref(30)
-const strokes = ref<Stroke[]>([])
 const currentStroke = ref<Stroke | null>(null)
 
 const isProcessing = ref(false)
@@ -32,13 +31,10 @@ const imageLoadError = ref<string | null>(null)
 const history = shallowRef<ImageData[]>([])
 /** 当前指向 history 中的位置（-1 表示原图） */
 const historyIndex = ref(-1)
-/** 笔迹 redo 栈 */
-const redoStrokes = ref<Stroke[]>([])
 
 const hasImage = computed(() => !!imageUrl.value)
-const hasMask = computed(() => strokes.value.length > 0)
-const canUndo = computed(() => strokes.value.length > 0 || historyIndex.value >= 0)
-const canRedo = computed(() => redoStrokes.value.length > 0 || historyIndex.value < history.value.length - 1)
+const canUndo = computed(() => historyIndex.value >= 0)
+const canRedo = computed(() => historyIndex.value < history.value.length - 1)
 
 import ImageLoaderWorker from '../workers/imageLoader.worker.ts?worker'
 
@@ -62,12 +58,10 @@ export function useEditorState() {
       imageHeight.value = bitmap.height
       originalImage.value = bitmap
       // 重置编辑状态
-      strokes.value = []
       currentStroke.value = null
       processedImageData.value = null
       history.value = []
       historyIndex.value = -1
-      redoStrokes.value = []
       mode.value = 'view'
       imageUrl.value = URL.createObjectURL(file)
       console.log(`[loadImage] 图片加载流程完成, 总耗时 ${(performance.now() - t0).toFixed(0)}ms`)
@@ -118,24 +112,18 @@ export function useEditorState() {
     }
   }
 
-  function endStroke() {
-    if (currentStroke.value && currentStroke.value.points.length > 0) {
-      strokes.value = [...strokes.value, currentStroke.value]
-      // 新笔迹产生时清空笔迹 redo 栈
-      redoStrokes.value = []
-    }
+  function endStroke(): Stroke | null {
+    const stroke = currentStroke.value
     currentStroke.value = null
+    if (!stroke || stroke.points.length === 0) {
+      return null
+    }
+    return stroke
   }
 
-  /** 撤销：优先撤销笔迹，笔迹清空后撤销消除操作 */
+  /** 撤销图片历史 */
   function undo() {
-    if (strokes.value.length > 0) {
-      // 撤销最后一笔，存入 redo 栈
-      const removed = strokes.value[strokes.value.length - 1]
-      strokes.value = strokes.value.slice(0, -1)
-      redoStrokes.value = [...redoStrokes.value, removed]
-    } else if (historyIndex.value >= 0) {
-      // 回退消除操作
+    if (historyIndex.value >= 0) {
       historyIndex.value--
       processedImageData.value = historyIndex.value >= 0
         ? history.value[historyIndex.value]
@@ -143,24 +131,16 @@ export function useEditorState() {
     }
   }
 
-  /** 重做 */
+  /** 重做图片历史 */
   function redo() {
-    if (redoStrokes.value.length > 0) {
-      // 恢复笔迹
-      const restored = redoStrokes.value[redoStrokes.value.length - 1]
-      redoStrokes.value = redoStrokes.value.slice(0, -1)
-      strokes.value = [...strokes.value, restored]
-    } else if (historyIndex.value < history.value.length - 1) {
-      // 前进消除操作
+    if (historyIndex.value < history.value.length - 1) {
       historyIndex.value++
       processedImageData.value = history.value[historyIndex.value]
     }
   }
 
   function clearMask() {
-    strokes.value = []
     currentStroke.value = null
-    redoStrokes.value = []
   }
 
   /** 消除成功后调用：将结果存入历史 */
@@ -193,18 +173,15 @@ export function useEditorState() {
     originalImage,
     mode,
     brushSize,
-    strokes,
     currentStroke,
     isProcessing,
     processedImageData,
     history,
     historyIndex,
-    redoStrokes,
     imageLoading,
     imageLoadError,
     // Computed
     hasImage,
-    hasMask,
     canUndo,
     canRedo,
     // Actions

@@ -7,13 +7,12 @@ import PanoViewer from './components/PanoViewer.vue'
 import DownloadModal from './components/DownloadModal.vue'
 import ProcessingModal from './components/ProcessingModal.vue'
 import ImageLoadingModal from './components/ImageLoadingModal.vue'
-import { useEditorState } from './composables/useEditorState'
+import { useEditorState, type Stroke } from './composables/useEditorState'
 import { processInpainting } from './utils/inpainting'
 import { loadModel, isModelCached, modelLoaded } from './utils/model'
 
 const {
   hasImage,
-  strokes,
   isProcessing,
   imageWidth,
   imageHeight,
@@ -31,7 +30,6 @@ const showProcessingModal = ref(false)
 const processingStatus = ref('')
 const processingProgress = ref(0)
 
-// 进入页面检测模型是否已缓存
 onMounted(async () => {
   const cached = await isModelCached()
   if (!cached) {
@@ -53,10 +51,16 @@ async function handleStartDownload(url: string) {
   }
 }
 
-async function handleErase() {
+async function handleAutoErase(stroke: Stroke) {
+  if (isProcessing.value) return
+
+  if (!modelLoaded.value) {
+    alert('模型正在加载，稍后再试')
+    return
+  }
+
   const source = getCurrentImageForProcessing()
-  if (!source || strokes.value.length === 0) return
-  if (!modelLoaded.value) return
+  if (!source) return
 
   isProcessing.value = true
   showProcessingModal.value = true
@@ -64,16 +68,11 @@ async function handleErase() {
   processingProgress.value = 0
 
   try {
-    await new Promise(resolve => setTimeout(resolve, 50))
-
-    const result = await processInpainting(
-      source,
-      strokes.value,
-      (current, total) => {
-        processingProgress.value = Math.round((current / total) * 100)
-        processingStatus.value = `AI 消除中 (${current}/${total})`
-      }
-    )
+    await new Promise(resolve => setTimeout(resolve, 30))
+    const result = await processInpainting(source, stroke, (current, total) => {
+      processingProgress.value = Math.round((current / total) * 100)
+      processingStatus.value = 'AI 消除中...'
+    })
     commitErase(result)
   } catch (error: any) {
     console.error('消除处理失败:', error)
@@ -121,9 +120,13 @@ async function handleExport() {
   <div class="h-screen w-screen flex flex-col overflow-hidden bg-white">
     <TopBar @export="handleExport" />
     <div class="flex flex-1 overflow-hidden">
-      <ToolBar :model-loaded="modelLoaded" @erase="handleErase" />
+      <ToolBar />
       <UploadZone v-if="!hasImage" />
-      <PanoViewer v-else />
+      <PanoViewer
+        v-else
+        :can-erase="modelLoaded && !isProcessing"
+        @auto-erase="handleAutoErase"
+      />
     </div>
 
     <DownloadModal

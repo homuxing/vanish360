@@ -2,8 +2,16 @@
 import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { useEditorState } from '../composables/useEditorState'
-import { drawMaskOnCanvas, drawEllipseStamp, drawSegmentWithStamps } from '../utils/mask'
+import { useEditorState, type Stroke } from '../composables/useEditorState'
+import { drawEllipseStamp, drawSegmentWithStamps } from '../utils/mask'
+
+const props = defineProps<{
+  canErase: boolean
+}>()
+
+const emit = defineEmits<{
+  autoErase: [stroke: Stroke]
+}>()
 
 const {
   imageUrl,
@@ -12,7 +20,6 @@ const {
   originalImage,
   mode,
   brushSize,
-  strokes,
   currentStroke,
   processedImageData,
   startStroke,
@@ -34,22 +41,19 @@ let controls: OrbitControls | null = null
 let sphere: THREE.Mesh | null = null
 let animationId: number | null = null
 
-// 纹理
 let baseTexture: THREE.CanvasTexture | null = null
 let maskTexture: THREE.CanvasTexture | null = null
 let shaderMaterial: THREE.ShaderMaterial | null = null
 
-// 蒙版 Canvas（低分辨率用于实时涂抹）
 let maskCanvas: HTMLCanvasElement | null = null
 let maskCtx: CanvasRenderingContext2D | null = null
-const MASK_SCALE = 0.25  // 蒙版用 1/4 分辨率
+const MASK_SCALE = 0.25
 
 let isDrawing = false
 let spacePressed = false
 let maskDirty = false
 let lastPointCount = 0
 
-// 自定义 shader：GPU 端混合底图 + 蒙版
 const vertexShader = `
   varying vec2 vUv;
   void main() {
@@ -71,8 +75,6 @@ const fragmentShader = `
     gl_FragColor = vec4(color, 1.0);
   }
 `
-
-// ===== Three.js 初始化 =====
 
 function initThree() {
   if (!containerRef.value) return
@@ -105,7 +107,6 @@ function initThree() {
   const geometry = new THREE.SphereGeometry(50, 64, 32)
   geometry.scale(-1, 1, 1)
 
-  // 创建一个占位 material，加载纹理后替换为 shader
   const placeholderMat = new THREE.MeshBasicMaterial({ color: 0x222222 })
   sphere = new THREE.Mesh(geometry, placeholderMat)
   scene.add(sphere)
@@ -120,7 +121,6 @@ function animate() {
 
   controls.update()
 
-  // 蒙版脏标记：仅标记纹理需要更新（极低开销）
   if (maskDirty && maskTexture) {
     maskTexture.needsUpdate = true
     maskDirty = false
@@ -138,15 +138,12 @@ function handleResize() {
   camera.updateProjectionMatrix()
 }
 
-// ===== 纹理和 shader 管理 =====
-
 function setupTextures() {
   if (!sphere) return
   const w = imageWidth.value
   const h = imageHeight.value
   if (!w || !h) return
 
-  // 底图 Canvas + 纹理
   const baseCanvas = document.createElement('canvas')
   baseCanvas.width = w
   baseCanvas.height = h
@@ -162,7 +159,6 @@ function setupTextures() {
   baseTexture.minFilter = THREE.LinearFilter
   baseTexture.magFilter = THREE.LinearFilter
 
-  // 蒙版 Canvas（低分辨率）+ 纹理
   const mw = Math.round(w * MASK_SCALE)
   const mh = Math.round(h * MASK_SCALE)
   maskCanvas = document.createElement('canvas')
@@ -176,7 +172,6 @@ function setupTextures() {
   maskTexture.minFilter = THREE.LinearFilter
   maskTexture.magFilter = THREE.LinearFilter
 
-  // 创建 ShaderMaterial
   if (shaderMaterial) shaderMaterial.dispose()
   shaderMaterial = new THREE.ShaderMaterial({
     vertexShader,
@@ -189,7 +184,6 @@ function setupTextures() {
     },
   })
 
-  // 替换 sphere 的 material
   const oldMat = sphere.material as THREE.Material
   sphere.material = shaderMaterial
   oldMat.dispose()
@@ -210,21 +204,9 @@ function updateBaseTexture() {
   baseTexture.needsUpdate = true
 }
 
-// ===== 蒙版绘制 =====
-
 function clearMaskCanvas() {
   if (!maskCtx || !maskCanvas) return
   maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height)
-  maskDirty = true
-}
-
-function redrawFullMask() {
-  if (!maskCtx || !maskCanvas) return
-  const mw = maskCanvas.width
-  const mh = maskCanvas.height
-  maskCtx.clearRect(0, 0, mw, mh)
-  // 在低分辨率蒙版上重绘所有笔迹，传入 MASK_SCALE 保持与 appendToMask 一致
-  drawMaskOnCanvas(maskCtx, strokes.value, mw, mh, currentStroke.value, 'white', false, MASK_SCALE)
   maskDirty = true
 }
 
@@ -242,19 +224,14 @@ function appendToMask() {
   }
 
   maskCtx.fillStyle = 'white'
-
-  // 增量绘制：从 lastPointCount 位置开始
   const startIdx = Math.max(0, lastPointCount - 1)
 
   if (points.length === 1 && lastPointCount === 0) {
-    // 单点绘制椭圆
     drawEllipseStamp(maskCtx, points[0][0], points[0][1], baseRadius, mw, mh)
   } else {
-    // 绘制新增的线段
     for (let i = startIdx; i < points.length - 1; i++) {
       drawSegmentWithStamps(maskCtx, points[i], points[i + 1], baseRadius, mw, mh)
     }
-    // 确保最后一点被绘制
     if (lastPointCount < points.length) {
       const last = points[points.length - 1]
       drawEllipseStamp(maskCtx, last[0], last[1], baseRadius, mw, mh)
@@ -264,8 +241,6 @@ function appendToMask() {
   lastPointCount = points.length
   maskDirty = true
 }
-
-// ===== Raycasting 取 UV =====
 
 function getUVFromEvent(e: MouseEvent): [number, number] | null {
   if (!containerRef.value || !camera || !sphere) return null
@@ -283,14 +258,10 @@ function getUVFromEvent(e: MouseEvent): [number, number] | null {
   return [intersects[0].uv.x, intersects[0].uv.y]
 }
 
-// ===== 交互模式 =====
-
 function updateInteractionMode() {
   if (!controls) return
   controls.enabled = (mode.value === 'view') || spacePressed
 }
-
-// ===== 画笔大小换算 =====
 
 function screenBrushToImagePixels(): number {
   if (!containerRef.value || !camera) return brushSize.value
@@ -302,15 +273,14 @@ function screenBrushToImagePixels(): number {
   return Math.max(2, imagePixels)
 }
 
-// ===== 鼠标事件 =====
-
 function handleMouseDown(e: MouseEvent) {
-  if (mode.value !== 'brush' || spacePressed) return
+  if (mode.value !== 'brush' || spacePressed || !props.canErase) return
   if (e.button !== 0) return
 
   const uv = getUVFromEvent(e)
   if (!uv) return
 
+  clearMaskCanvas()
   isDrawing = true
   lastPointCount = 0
   startStroke()
@@ -340,11 +310,16 @@ function handleMouseMove(e: MouseEvent) {
 function handleMouseUp() {
   if (!isDrawing) return
   isDrawing = false
-  endStroke()
   lastPointCount = 0
-}
 
-// ===== 键盘事件 =====
+  const stroke = endStroke()
+  if (!stroke || !props.canErase) {
+    clearMaskCanvas()
+    return
+  }
+
+  emit('autoErase', stroke)
+}
 
 function handleKeyDown(e: KeyboardEvent) {
   if (e.target instanceof HTMLInputElement) return
@@ -373,11 +348,11 @@ function handleKeyDown(e: KeyboardEvent) {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey) {
         e.preventDefault()
         redo()
-        redrawFullMask()
+        clearMaskCanvas()
       } else if (e.ctrlKey || e.metaKey) {
         e.preventDefault()
         undo()
-        redrawFullMask()
+        clearMaskCanvas()
       }
       break
   }
@@ -399,15 +374,7 @@ function handleWheel(e: WheelEvent) {
   }
 }
 
-// ===== Watchers =====
-
 watch(mode, updateInteractionMode)
-
-watch(strokes, () => {
-  if (!isDrawing) {
-    redrawFullMask()
-  }
-}, { deep: true })
 
 watch(processedImageData, () => {
   updateBaseTexture()
@@ -420,8 +387,6 @@ watch(imageUrl, async (url) => {
   if (!renderer) initThree()
   setupTextures()
 })
-
-// ===== 生命周期 =====
 
 onMounted(() => {
   document.addEventListener('keydown', handleKeyDown)

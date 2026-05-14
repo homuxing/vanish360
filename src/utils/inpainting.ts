@@ -6,28 +6,152 @@ import type { Stroke } from '../composables/useEditorState'
 // 重新导出模型相关 API（保持向后兼容）
 export { isModelCached, loadModel, modelLoading, modelProgress, modelLoaded, modelError, DEFAULT_MODEL_URL } from './model'
 
-// LaMa 模型固定输入尺寸
 const LAMA_SIZE = 512
+const MAX_PATCH_SIZE = 1280
+const PATCH_PADDING = 96
+const FEATHER_RADIUS = 12
 
-/**
- * 将 Canvas 区域缩放到 LaMa 输入尺寸
- */
-function resizeToLama(
-  sourceCanvas: HTMLCanvasElement,
-  sx: number, sy: number, sw: number, sh: number
-): HTMLCanvasElement {
-  const canvas = document.createElement('canvas')
-  canvas.width = LAMA_SIZE
-  canvas.height = LAMA_SIZE
-  const ctx = canvas.getContext('2d')!
-  ctx.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, LAMA_SIZE, LAMA_SIZE)
-  return canvas
+interface Vec3 {
+  x: number
+  y: number
+  z: number
 }
 
-/**
- * 将 ImageData 转为 NCHW 格式 Float32 张量 [1, 3, H, W]
- * LaMa 模型输入范围为 [0, 1]
- */
+interface Basis {
+  center: Vec3
+  east: Vec3
+  north: Vec3
+}
+
+function add(a: Vec3, b: Vec3): Vec3 {
+  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+}
+
+function scale(v: Vec3, s: number): Vec3 {
+  return { x: v.x * s, y: v.y * s, z: v.z * s }
+}
+
+function dot(a: Vec3, b: Vec3): number {
+  return a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+function cross(a: Vec3, b: Vec3): Vec3 {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x,
+  }
+}
+
+function normalize(v: Vec3): Vec3 {
+  const len = Math.hypot(v.x, v.y, v.z)
+  if (len < 1e-8) return { x: 0, y: 0, z: 1 }
+  return { x: v.x / len, y: v.y / len, z: v.z / len }
+}
+
+function uvToDir(u: number, v: number): Vec3 {
+  const lon = (u - 0.5) * 2 * Math.PI
+  const lat = (v - 0.5) * Math.PI
+  const cosLat = Math.cos(lat)
+  return {
+    x: cosLat * Math.sin(lon),
+    y: Math.sin(lat),
+    z: cosLat * Math.cos(lon),
+  }
+}
+
+function dirToUv(dir: Vec3): { u: number; v: number } {
+  const n = normalize(dir)
+  const lon = Math.atan2(n.x, n.z)
+  const lat = Math.asin(Math.max(-1, Math.min(1, n.y)))
+  let u = lon / (2 * Math.PI) + 0.5
+  if (u < 0) u += 1
+  if (u >= 1) u -= 1
+  const v = lat / Math.PI + 0.5
+  return { u, v }
+}
+
+function buildBasisFromStroke(stroke: Stroke): Basis {
+  let sum = { x: 0, y: 0, z: 0 }
+  for (const p of stroke.points) {
+    sum = add(sum, uvToDir(p[0], p[1]))
+  }
+
+  let center = normalize(sum)
+  if (stroke.points.length === 1) {
+    center = uvToDir(stroke.points[0][0], stroke.points[0][1])
+  }
+
+  const worldUp: Vec3 = { x: 0, y: 1, z: 0 }
+  const fallbackAxis: Vec3 = { x: 1, y: 0, z: 0 }
+  let east = cross(worldUp, center)
+  if (Math.hypot(east.x, east.y, east.z) < 1e-5) {
+    east = cross(fallbackAxis, center)
+  }
+  east = normalize(east)
+  const north = normalize(cross(center, east))
+
+  return { center, east, north }
+}
+
+function clamp(v: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, v))
+}
+
+function angularDistance(a: Vec3, b: Vec3): number {
+  return Math.acos(clamp(dot(a, b), -1, 1))
+}
+
+function computePatchHalfAngle(
+  stroke: Stroke,
+  basis: Basis,
+  imageHeight: number
+): number {
+  let maxAngle = 0
+  for (const [u, v] of stroke.points) {
+    const dir = uvToDir(u, v)
+    const angle = angularDistance(dir, basis.center)
+    if (angle > maxAngle) maxAngle = angle
+  }
+
+  const brushRadiusPx = Math.max(1, stroke.size / 2)
+  const brushRadiusAngle = (brushRadiusPx / imageHeight) * Math.PI
+  const safety = 0.14
+
+  return clamp(maxAngle + brushRadiusAngle + safety, 0.18, Math.PI * 0.48)
+}
+
+function computePatchSizeFromAngle(halfAngle: number, imageWidth: number): number {
+  const pixelsPerRadian = imageWidth / (2 * Math.PI)
+  const patchDiameter = 2 * halfAngle * pixelsPerRadian
+  const target = Math.round(patchDiameter + PATCH_PADDING * 2)
+  return Math.max(320, Math.min(MAX_PATCH_SIZE, target))
+}
+
+function sampleEquirectNearest(
+  srcData: Uint8ClampedArray,
+  srcWidth: number,
+  srcHeight: number,
+  u: number,
+  v: number,
+  out: Uint8ClampedArray,
+  outOffset: number
+) {
+  let sx = Math.round(u * srcWidth)
+  if (sx < 0) sx = 0
+  if (sx >= srcWidth) sx = srcWidth - 1
+
+  let sy = Math.round((1 - v) * srcHeight)
+  if (sy < 0) sy = 0
+  if (sy >= srcHeight) sy = srcHeight - 1
+
+  const idx = (sy * srcWidth + sx) * 4
+  out[outOffset] = srcData[idx]
+  out[outOffset + 1] = srcData[idx + 1]
+  out[outOffset + 2] = srcData[idx + 2]
+  out[outOffset + 3] = 255
+}
+
 function imageDataToTensor(imageData: ImageData): Float32Array {
   const { data, width, height } = imageData
   const tensor = new Float32Array(3 * width * height)
@@ -41,10 +165,6 @@ function imageDataToTensor(imageData: ImageData): Float32Array {
   return tensor
 }
 
-/**
- * 将蒙版 ImageData 转为 NCHW 格式 Float32 张量 [1, 1, H, W]
- * LaMa 模型期望 mask: 0.0=保留, 1.0=需填充
- */
 function maskDataToTensor(imageData: ImageData): Float32Array {
   const { data, width, height } = imageData
   const tensor = new Float32Array(width * height)
@@ -55,10 +175,6 @@ function maskDataToTensor(imageData: ImageData): Float32Array {
   return tensor
 }
 
-/**
- * 将模型输出张量写回 ImageData
- * 此 LaMa ONNX 模型输出范围为 [0, 255]
- */
 function tensorToImageData(tensor: Float32Array, width: number, height: number): ImageData {
   const imageData = new ImageData(width, height)
   const channelSize = width * height
@@ -72,192 +188,223 @@ function tensorToImageData(tensor: Float32Array, width: number, height: number):
   return imageData
 }
 
-/**
- * 根据 tile 行的纬度位置计算自适应水平步进
- * 极点附近像素在球面上高度重叠，可以使用更大步进减少冗余 tile
- */
-function getAdaptiveStepX(
-  tileY: number,
-  tileSize: number,
-  imageHeight: number,
-  baseStepSize: number
-): number {
-  // tile 中心的归一化纵坐标（0=顶部/北极，1=底部/南极）
-  const tileCenterY = tileY + tileSize / 2
-  const v = tileCenterY / imageHeight
-  // 纬度：赤道=0，极点=±π/2
-  const latitude = Math.PI * (v - 0.5)
-  const cosLat = Math.max(Math.cos(latitude), 0.125)
-
-  // 极点处步进更大（像素冗余高），但不超过 tileSize - 16（保证最少 16px overlap）
-  const adaptiveStep = Math.min(
-    Math.round(baseStepSize / cosLat),
-    tileSize - 16
-  )
-  return Math.max(baseStepSize, adaptiveStep)
-}
-
-/**
- * 对蒙版区域执行 LaMa inpainting
- */
-export async function processInpainting(
-  source: HTMLImageElement | ImageBitmap | ImageData,
-  strokes: Stroke[],
-  onProgress?: (current: number, total: number) => void
-): Promise<ImageData> {
-  console.log(`[processInpainting] 开始处理, 笔迹数: ${strokes.length}`)
-  const t0 = performance.now()
-
-  let session = getSession()
-  if (!session) {
-    console.log('[processInpainting] 模型未就绪, 正在加载...')
-    await loadModel()
-    session = getSession()
-  }
-  if (!session) throw new Error('模型未加载')
-
-  let width: number
-  let height: number
+function resizeToLama(source: ImageData): ImageData {
+  const canvas = document.createElement('canvas')
+  canvas.width = LAMA_SIZE
+  canvas.height = LAMA_SIZE
+  const ctx = canvas.getContext('2d')!
 
   const srcCanvas = document.createElement('canvas')
-  if (source instanceof ImageData) {
-    width = source.width
-    height = source.height
-    srcCanvas.width = width
-    srcCanvas.height = height
-    const srcCtx = srcCanvas.getContext('2d')!
-    srcCtx.putImageData(source, 0, 0)
-  } else {
-    // HTMLImageElement 或 ImageBitmap
-    width = source instanceof HTMLImageElement ? source.naturalWidth : source.width
-    height = source instanceof HTMLImageElement ? source.naturalHeight : source.height
-    srcCanvas.width = width
-    srcCanvas.height = height
-    const srcCtx = srcCanvas.getContext('2d')!
-    srcCtx.drawImage(source, 0, 0)
-  }
-  console.log(`[processInpainting] 源图尺寸: ${width}x${height}`)
+  srcCanvas.width = source.width
+  srcCanvas.height = source.height
+  srcCanvas.getContext('2d')!.putImageData(source, 0, 0)
 
-  // 生成二值蒙版
-  const maskImageData = generateBinaryMask(strokes, width, height)
-  const maskCanvas = document.createElement('canvas')
-  maskCanvas.width = width
-  maskCanvas.height = height
-  const maskCtx = maskCanvas.getContext('2d')!
-  maskCtx.putImageData(maskImageData, 0, 0)
+  ctx.drawImage(srcCanvas, 0, 0, source.width, source.height, 0, 0, LAMA_SIZE, LAMA_SIZE)
+  return ctx.getImageData(0, 0, LAMA_SIZE, LAMA_SIZE)
+}
 
-  // 创建结果 Canvas
-  const resultCanvas = document.createElement('canvas')
-  resultCanvas.width = width
-  resultCanvas.height = height
-  const resultCtx = resultCanvas.getContext('2d')!
-  resultCtx.drawImage(srcCanvas, 0, 0)
+function resizeBack(source: ImageData, width: number, height: number): ImageData {
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')!
 
-  // 找到蒙版的边界框
-  const bounds = getMaskBounds(maskImageData)
+  const srcCanvas = document.createElement('canvas')
+  srcCanvas.width = source.width
+  srcCanvas.height = source.height
+  srcCanvas.getContext('2d')!.putImageData(source, 0, 0)
+
+  ctx.drawImage(srcCanvas, 0, 0, source.width, source.height, 0, 0, width, height)
+  return ctx.getImageData(0, 0, width, height)
+}
+
+function runLamaOnPatch(
+  session: ort.InferenceSession,
+  patchImage: ImageData,
+  patchMask: ImageData
+): Promise<ImageData> {
+  const image512 = resizeToLama(patchImage)
+  const mask512 = resizeToLama(patchMask)
+
+  const imageTensor = imageDataToTensor(image512)
+  const maskTensor = maskDataToTensor(mask512)
+
+  const inputNames = session.inputNames
+  const feeds: Record<string, ort.Tensor> = {}
+  feeds[inputNames[0]] = new ort.Tensor('float32', imageTensor, [1, 3, LAMA_SIZE, LAMA_SIZE])
+  feeds[inputNames[1]] = new ort.Tensor('float32', maskTensor, [1, 1, LAMA_SIZE, LAMA_SIZE])
+
+  return session.run(feeds).then((results) => {
+    const outputKey = session.outputNames[0]
+    const outputTensor = results[outputKey]
+    const outputData = outputTensor.data as Float32Array
+    const output512 = tensorToImageData(outputData, LAMA_SIZE, LAMA_SIZE)
+    return resizeBack(output512, patchImage.width, patchImage.height)
+  })
+}
+
+function buildPatch(
+  srcImage: ImageData,
+  srcMask: ImageData,
+  stroke: Stroke
+): {
+  patchImage: ImageData
+  patchMask: ImageData
+  basis: Basis
+  patchSize: number
+  patchHalfAngle: number
+} {
+  const bounds = getMaskBounds(srcMask)
   if (!bounds) {
-    console.log('[processInpainting] 未检测到蒙版区域, 跳过处理')
-    return resultCtx.getImageData(0, 0, width, height)
+    throw new Error('未检测到有效蒙版')
   }
-  console.log(`[processInpainting] 蒙版边界框: x=${bounds.x}, y=${bounds.y}, w=${bounds.w}, h=${bounds.h}`)
 
-  // 扩展 bounds 加 padding
-  const padding = 64
-  const bx = Math.max(0, bounds.x - padding)
-  const by = Math.max(0, bounds.y - padding)
-  const bw = Math.min(width - bx, bounds.w + padding * 2)
-  const bh = Math.min(height - by, bounds.h + padding * 2)
+  const basis = buildBasisFromStroke(stroke)
+  const patchHalfAngle = computePatchHalfAngle(stroke, basis, srcImage.height)
+  const patchSize = computePatchSizeFromAngle(patchHalfAngle, srcImage.width)
 
-  // 计算 tile（纬度自适应水平步进）
-  const tileSize = LAMA_SIZE
-  const overlap = 64
-  const baseStepSize = tileSize - overlap * 2
+  const patchImage = new ImageData(patchSize, patchSize)
+  const patchMask = new ImageData(patchSize, patchSize)
 
-  const tilesY = Math.max(1, Math.ceil(bh / baseStepSize))
+  const srcPixels = srcImage.data
+  const srcMaskPixels = srcMask.data
+  const patchPixels = patchImage.data
+  const patchMaskPixels = patchMask.data
 
-  // 预计算总 tile 数（考虑纬度自适应）
-  let totalTiles = 0
-  const rowTileCounts: number[] = []
-  for (let ty = 0; ty < tilesY; ty++) {
-    let tileY = by + ty * baseStepSize
-    if (tileY + tileSize > height) tileY = Math.max(0, height - tileSize)
-    const adaptiveStepX = getAdaptiveStepX(tileY, tileSize, height, baseStepSize)
-    const tilesXForRow = Math.max(1, Math.ceil(bw / adaptiveStepX))
-    rowTileCounts.push(tilesXForRow)
-    totalTiles += tilesXForRow
-  }
-  console.log(`[processInpainting] 分块: ${tilesY} 行, 总计 ${totalTiles} tiles (纬度自适应)`)
+  for (let py = 0; py < patchSize; py++) {
+    const ny = ((py + 0.5) / patchSize) * 2 - 1
+    for (let px = 0; px < patchSize; px++) {
+      const nx = ((px + 0.5) / patchSize) * 2 - 1
+      const idx = (py * patchSize + px) * 4
 
-  let processed = 0
-  let inferenceTime = 0
+      const tanX = nx * Math.tan(patchHalfAngle)
+      const tanY = ny * Math.tan(patchHalfAngle)
+      const dir = normalize(add(add(basis.center, scale(basis.east, tanX)), scale(basis.north, -tanY)))
 
-  for (let ty = 0; ty < tilesY; ty++) {
-    let tileY = by + ty * baseStepSize
-    if (tileY + tileSize > height) tileY = Math.max(0, height - tileSize)
+      const uv = dirToUv(dir)
+      sampleEquirectNearest(srcPixels, srcImage.width, srcImage.height, uv.u, uv.v, patchPixels, idx)
+      sampleEquirectNearest(srcMaskPixels, srcMask.width, srcMask.height, uv.u, uv.v, patchMaskPixels, idx)
 
-    const adaptiveStepX = getAdaptiveStepX(tileY, tileSize, height, baseStepSize)
-    const tilesXForRow = rowTileCounts[ty]
-
-    for (let tx = 0; tx < tilesXForRow; tx++) {
-      let tileX = bx + tx * adaptiveStepX
-      if (tileX + tileSize > width) tileX = Math.max(0, width - tileSize)
-
-      const tileW = Math.min(tileSize, width - tileX)
-      const tileH = Math.min(tileSize, height - tileY)
-
-      if (!tileHasMask(maskImageData, tileX, tileY, tileW, tileH, width)) {
-        processed++
-        continue
-      }
-
-      const tileImageCanvas = resizeToLama(srcCanvas, tileX, tileY, tileW, tileH)
-      const tileMaskCanvas = resizeToLama(maskCanvas, tileX, tileY, tileW, tileH)
-
-      const tileImageData = tileImageCanvas.getContext('2d')!.getImageData(0, 0, LAMA_SIZE, LAMA_SIZE)
-      const tileMaskData = tileMaskCanvas.getContext('2d')!.getImageData(0, 0, LAMA_SIZE, LAMA_SIZE)
-
-      const imageTensor = imageDataToTensor(tileImageData)
-      const maskTensor = maskDataToTensor(tileMaskData)
-
-      const inputNames = session.inputNames
-      const feeds: Record<string, ort.Tensor> = {}
-      feeds[inputNames[0]] = new ort.Tensor('float32', imageTensor, [1, 3, LAMA_SIZE, LAMA_SIZE])
-      feeds[inputNames[1]] = new ort.Tensor('float32', maskTensor, [1, 1, LAMA_SIZE, LAMA_SIZE])
-
-      const tInfer = performance.now()
-      const results = await session.run(feeds)
-      inferenceTime += performance.now() - tInfer
-
-      const outputKey = session.outputNames[0]
-      const outputTensor = results[outputKey]
-      const outputData = outputTensor.data as Float32Array
-
-      const outputImageData = tensorToImageData(outputData, LAMA_SIZE, LAMA_SIZE)
-
-      const outputCanvas = document.createElement('canvas')
-      outputCanvas.width = LAMA_SIZE
-      outputCanvas.height = LAMA_SIZE
-      outputCanvas.getContext('2d')!.putImageData(outputImageData, 0, 0)
-
-      blendTileResult(resultCtx, outputCanvas, maskCanvas, tileX, tileY, tileW, tileH)
-
-      processed++
-      onProgress?.(processed, totalTiles)
+      patchMaskPixels[idx + 3] = 255
     }
   }
 
-  const totalTime = performance.now() - t0
-  console.log(`[processInpainting] 处理完成, 总耗时 ${totalTime.toFixed(0)}ms, 推理耗时 ${inferenceTime.toFixed(0)}ms, 处理 ${processed}/${totalTiles} tiles`)
-
-  return resultCtx.getImageData(0, 0, width, height)
+  return {
+    patchImage,
+    patchMask,
+    basis,
+    patchSize,
+    patchHalfAngle,
+  }
 }
 
-/**
- * 获取蒙版的包围盒
- */
+function blendPatchBack(
+  result: ImageData,
+  original: ImageData,
+  patchResult: ImageData,
+  patchMask: ImageData,
+  basis: Basis,
+  patchSize: number,
+  patchHalfAngle: number
+) {
+  const width = result.width
+  const height = result.height
+  const out = result.data
+  const src = original.data
+  const patch = patchResult.data
+  const mask = patchMask.data
+
+  const invTanHalf = 1 / Math.tan(patchHalfAngle)
+
+  for (let y = 0; y < height; y++) {
+    const v = 1 - (y + 0.5) / height
+    for (let x = 0; x < width; x++) {
+      const u = (x + 0.5) / width
+      const dir = uvToDir(u, v)
+
+      const z = dot(dir, basis.center)
+      if (z <= 0) continue
+
+      const tx = dot(dir, basis.east) / z
+      const ty = -dot(dir, basis.north) / z
+      const nx = tx * invTanHalf
+      const ny = ty * invTanHalf
+      if (Math.abs(nx) > 1 || Math.abs(ny) > 1) continue
+
+      const px = Math.floor(((nx + 1) * 0.5) * patchSize)
+      const py = Math.floor(((ny + 1) * 0.5) * patchSize)
+      if (px < 0 || px >= patchSize || py < 0 || py >= patchSize) continue
+
+      const patchIdx = (py * patchSize + px) * 4
+      const maskVal = mask[patchIdx]
+      if (maskVal <= 8) continue
+
+      const dist = distanceToMaskEdge(mask, patchSize, patchSize, px, py, FEATHER_RADIUS)
+      const alpha = Math.min(1, Math.max(0, dist / FEATHER_RADIUS))
+
+      const dstIdx = (y * width + x) * 4
+      out[dstIdx] = Math.round(patch[patchIdx] * alpha + src[dstIdx] * (1 - alpha))
+      out[dstIdx + 1] = Math.round(patch[patchIdx + 1] * alpha + src[dstIdx + 1] * (1 - alpha))
+      out[dstIdx + 2] = Math.round(patch[patchIdx + 2] * alpha + src[dstIdx + 2] * (1 - alpha))
+      out[dstIdx + 3] = 255
+    }
+  }
+}
+
+function distanceToMaskEdge(
+  mask: Uint8ClampedArray,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+  limit: number
+): number {
+  if (x < 0 || x >= width || y < 0 || y >= height) return 0
+  const idx = (y * width + x) * 4
+  if (mask[idx] <= 8) return 0
+
+  let minDist = limit
+  for (let r = 1; r <= limit; r++) {
+    const left = x - r
+    const right = x + r
+    const top = y - r
+    const bottom = y + r
+
+    for (let xx = left; xx <= right; xx++) {
+      if (top >= 0) {
+        const i = (top * width + Math.max(0, Math.min(width - 1, xx))) * 4
+        if (mask[i] <= 8) return r
+      }
+      if (bottom < height) {
+        const i = (bottom * width + Math.max(0, Math.min(width - 1, xx))) * 4
+        if (mask[i] <= 8) return r
+      }
+    }
+
+    for (let yy = top + 1; yy <= bottom - 1; yy++) {
+      if (yy < 0 || yy >= height) continue
+      if (left >= 0) {
+        const i = (yy * width + left) * 4
+        if (mask[i] <= 8) return r
+      }
+      if (right < width) {
+        const i = (yy * width + right) * 4
+        if (mask[i] <= 8) return r
+      }
+    }
+
+    minDist = r
+  }
+
+  return minDist
+}
+
 function getMaskBounds(maskData: ImageData): { x: number; y: number; w: number; h: number } | null {
   const { data, width, height } = maskData
-  let minX = width, minY = height, maxX = 0, maxY = 0
+  let minX = width
+  let minY = height
+  let maxX = 0
+  let maxY = 0
   let found = false
 
   for (let y = 0; y < height; y++) {
@@ -277,62 +424,56 @@ function getMaskBounds(maskData: ImageData): { x: number; y: number; w: number; 
   return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 }
 }
 
-/**
- * 检查 tile 区域是否包含蒙版
- */
-function tileHasMask(
-  maskData: ImageData,
-  tx: number, ty: number, tw: number, th: number,
-  fullWidth: number
-): boolean {
-  const { data } = maskData
-  const endX = Math.min(tx + tw, maskData.width)
-  const endY = Math.min(ty + th, maskData.height)
+function toImageData(source: HTMLImageElement | ImageBitmap | ImageData): ImageData {
+  if (source instanceof ImageData) return source
 
-  for (let y = ty; y < endY; y += 4) {
-    for (let x = tx; x < endX; x += 4) {
-      const idx = (y * fullWidth + x) * 4
-      if (data[idx] > 128) return true
-    }
-  }
-  return false
+  const width = source instanceof HTMLImageElement ? source.naturalWidth : source.width
+  const height = source instanceof HTMLImageElement ? source.naturalHeight : source.height
+
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')!
+  ctx.drawImage(source, 0, 0)
+  return ctx.getImageData(0, 0, width, height)
 }
 
-/**
- * 将 tile 推理结果混合回原图（仅蒙版区域）
- */
-function blendTileResult(
-  resultCtx: CanvasRenderingContext2D,
-  outputCanvas: HTMLCanvasElement,
-  maskCanvas: HTMLCanvasElement,
-  tileX: number, tileY: number,
-  tileW: number, tileH: number
-) {
-  const tileSize = outputCanvas.width
-  const resultData = resultCtx.getImageData(tileX, tileY, tileW, tileH)
+function yieldToBrowser(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()))
+}
 
-  const scaledCanvas = document.createElement('canvas')
-  scaledCanvas.width = tileW
-  scaledCanvas.height = tileH
-  const scaledCtx = scaledCanvas.getContext('2d')!
-  scaledCtx.drawImage(outputCanvas, 0, 0, tileSize, tileSize, 0, 0, tileW, tileH)
-  const scaledData = scaledCtx.getImageData(0, 0, tileW, tileH)
+export async function processInpainting(
+  source: HTMLImageElement | ImageBitmap | ImageData,
+  stroke: Stroke,
+  onProgress?: (current: number, total: number) => void
+): Promise<ImageData> {
+  const t0 = performance.now()
 
-  const maskCropCanvas = document.createElement('canvas')
-  maskCropCanvas.width = tileW
-  maskCropCanvas.height = tileH
-  const maskCropCtx = maskCropCanvas.getContext('2d')!
-  maskCropCtx.drawImage(maskCanvas, tileX, tileY, tileW, tileH, 0, 0, tileW, tileH)
-  const maskCropData = maskCropCtx.getImageData(0, 0, tileW, tileH)
-
-  for (let i = 0; i < resultData.data.length; i += 4) {
-    const maskVal = maskCropData.data[i]
-    if (maskVal > 10) {
-      resultData.data[i] = scaledData.data[i]
-      resultData.data[i + 1] = scaledData.data[i + 1]
-      resultData.data[i + 2] = scaledData.data[i + 2]
-    }
+  let session = getSession()
+  if (!session) {
+    await loadModel()
+    session = getSession()
   }
+  if (!session) throw new Error('模型未加载')
 
-  resultCtx.putImageData(resultData, tileX, tileY)
+  const srcImage = toImageData(source)
+  const srcMask = generateBinaryMask([stroke], srcImage.width, srcImage.height)
+
+  onProgress?.(1, 4)
+  await yieldToBrowser()
+
+  const { patchImage, patchMask, basis, patchSize, patchHalfAngle } = buildPatch(srcImage, srcMask, stroke)
+  onProgress?.(2, 4)
+  await yieldToBrowser()
+
+  const patchResult = await runLamaOnPatch(session, patchImage, patchMask)
+  onProgress?.(3, 4)
+  await yieldToBrowser()
+
+  const result = new ImageData(new Uint8ClampedArray(srcImage.data), srcImage.width, srcImage.height)
+  blendPatchBack(result, srcImage, patchResult, patchMask, basis, patchSize, patchHalfAngle)
+  onProgress?.(4, 4)
+
+  console.log(`[processInpainting] patch=${patchSize}x${patchSize}, total ${(performance.now() - t0).toFixed(0)}ms`)
+  return result
 }
